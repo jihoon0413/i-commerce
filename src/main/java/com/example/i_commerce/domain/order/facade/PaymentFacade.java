@@ -30,7 +30,9 @@ public class PaymentFacade {
     public void confirmPayment(PaymentConfirmRequest dto) {
 
         PaymentConfirmPrepareDto target = paymentService.validateAndPrepareConfirm(dto);
-        PaymentStatus previousStatus = PaymentStatus.READY;
+        // validateAndPrepareConfirm()에서 이미 READY -> PROCESSING으로 선점했으므로,
+        // 이후 상태 변화 기록의 직전 상태는 PROCESSING이다.
+        PaymentStatus previousStatus = PaymentStatus.PROCESSING;
 
         try {
             Map<String, Object> response = paymentService.requestConfirm(dto);
@@ -53,17 +55,8 @@ public class PaymentFacade {
             }
 
             if (e.getErrorCode() == PaymentErrorCode.PAYMENT_NETWORK_TIMEOUT) {
-                try {
-                    publisher.publishEvent(new OrderCompletedEvent(target.commands()));
-                    paymentService.handleTimeoutSuccess(target.tossOrderId());
-                } catch (AppException ex) {
-                    log.error("[비상] 타임아웃 대피 중 재고 부족 발생! 망취소 처리합니다.");
-                    try {
-                        paymentService.requestCanceled(new PaymentCancelRequest(target.tossOrderId(), dto.amount(), dto.paymentKey(), "타임아웃 대피 중 재고 부족으로 인한 망취소"));
-                    } catch (Exception ignored) {}
-                    paymentService.handleTimeoutFailed(target.tossOrderId());
-                    throw ex;
-                }
+                paymentService.handleTimeoutSuccess(target.tossOrderId());
+                throw new AppException(PaymentErrorCode.PAYMENT_UNKNOWN_HOLD);
             }
 
             if(e.getErrorCode() == ProductErrorCode.INSUFFICIENT_STOCK) {

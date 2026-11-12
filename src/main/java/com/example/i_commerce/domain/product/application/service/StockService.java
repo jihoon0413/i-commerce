@@ -39,6 +39,10 @@ public class StockService {
 
         validateAllStocksFound(productItemIds, stockMap);
 
+        if (stockHistoryRepository.existsDeductHistoryByOrderId(commands.getFirst().orderId())) {
+            return;
+        }
+
         List<Long> depletedItemIds = new ArrayList<>();
 
         for(StockDeductCommand command : commands) {
