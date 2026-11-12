@@ -15,6 +15,14 @@ public interface StockHistoryRepository extends JpaRepository<StockHistory, Long
     SELECT COUNT(sh) > 0
     FROM StockHistory sh
     WHERE sh.orderId = :orderId
+    AND sh.changeType = 'DEDUCT'
+    """)
+    boolean existsDeductHistoryByOrderId(@Param("orderId") Long orderId);
+
+    @Query("""
+    SELECT COUNT(sh) > 0
+    FROM StockHistory sh
+    WHERE sh.orderId = :orderId
     AND sh.changeType = 'RESTORE'
     """)
     boolean existsRestoreHistoryByOrderId(@Param("orderId") Long orderId);

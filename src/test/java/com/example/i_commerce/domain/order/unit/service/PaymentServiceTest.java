@@ -25,6 +25,7 @@ import com.example.i_commerce.domain.order.service.dto.PaymentCancelPreparedDto;
 import com.example.i_commerce.domain.order.service.dto.PaymentCancelRequest;
 import com.example.i_commerce.domain.order.service.dto.PaymentConfirmPrepareDto;
 import com.example.i_commerce.domain.order.service.dto.PaymentConfirmRequest;
+import com.example.i_commerce.domain.order.service.dto.PaymentDetailResponse;
 import com.example.i_commerce.global.exception.AppException;
 import java.util.List;
 import java.util.Optional;
@@ -63,6 +64,86 @@ public class PaymentServiceTest {
     String paymentKey = "toss_payment-key";
 
     @Nested
+    @DisplayName("결제 위젯 진입(getPaymentDetails) 테스트")
+    class GetPaymentDetailsTest {
+
+        private Long orderId;
+
+        @BeforeEach
+        void setUp() {
+            orderId = 1L;
+        }
+
+        @Test
+        @DisplayName("성공: 진행 중인 결제가 없으면 새 READY 결제를 발급한다")
+        void success_CreateNewReadyPayment() {
+            order = Order.builder()
+                    .userId(1L)
+                    .orderStatus(OrderStatus.PENDING)
+                    .totalPayAmount(10000)
+                    .orderProducts(List.of(OrderProduct.builder().productName("상품A").build()))
+                    .build();
+
+            given(orderRepository.findById(orderId)).willReturn(Optional.of(order));
+            given(paymentRepository.save(any(Payment.class)))
+                    .willAnswer(invocation -> invocation.getArgument(0));
+
+            PaymentDetailResponse response = paymentService.getPaymentDetails(1L, orderId);
+
+            assertThat(response).isNotNull();
+            assertThat(order.getPayments().size()).isEqualTo(1);
+            assertThat(order.getPayments().getFirst().getPayStatus()).isEqualTo(PaymentStatus.READY);
+        }
+
+        @Test
+        @DisplayName("성공: READY 결제가 이미 있으면 재사용하고, 더 오래된 READY 결제는 FAILED로 정리한다")
+        void success_ReuseReadyPayment_AndFailStaleOnes() {
+            Payment staleReady = Payment.builder().id(1L).payStatus(PaymentStatus.READY).build();
+            Payment latestReady = Payment.builder().id(2L).payStatus(PaymentStatus.READY).build();
+
+            order = Order.builder()
+                    .userId(1L)
+                    .orderStatus(OrderStatus.PENDING)
+                    .totalPayAmount(10000)
+                    .orderProducts(List.of(OrderProduct.builder().productName("상품A").build()))
+                    .payments(List.of(staleReady, latestReady))
+                    .build();
+
+            given(orderRepository.findById(orderId)).willReturn(Optional.of(order));
+
+            PaymentDetailResponse response = paymentService.getPaymentDetails(1L, orderId);
+
+            assertThat(response).isNotNull();
+            assertThat(latestReady.getPayStatus()).isEqualTo(PaymentStatus.READY);
+            assertThat(staleReady.getPayStatus()).isEqualTo(PaymentStatus.FAILED);
+        }
+
+        @Test
+        @DisplayName("실패: 가장 최근 결제가 이미 선점(PROCESSING)되어 있으면 새 결제를 만들지 않고 PAYMENT_ALREADY_PROCESSING 예외가 발생한다")
+        void fail_AlreadyProcessing_DoesNotIssueNewPayment() {
+            Payment processing = Payment.builder().id(1L).payStatus(PaymentStatus.PROCESSING).build();
+
+            order = Order.builder()
+                    .userId(1L)
+                    .orderStatus(OrderStatus.PENDING)
+                    .totalPayAmount(10000)
+                    .orderProducts(List.of(OrderProduct.builder().productName("상품A").build()))
+                    .payments(List.of(processing))
+                    .build();
+
+            given(orderRepository.findById(orderId)).willReturn(Optional.of(order));
+
+            assertThatThrownBy(() -> paymentService.getPaymentDetails(1L, orderId))
+                    .isInstanceOf(AppException.class)
+                    .extracting("errorCode")
+                    .isEqualTo(PaymentErrorCode.PAYMENT_ALREADY_PROCESSING);
+
+            // 새 결제가 추가로 발급되지 않아야 한다 (이중 결제 시도 방지)
+            assertThat(order.getPayments().size()).isEqualTo(1);
+        }
+    }
+
+    @Nested
     @DisplayName("결제 승인 사전 검증 및 준비 테스트")
     class ValidateAndPrepareConfirmTest {
 
@@ -88,14 +169,32 @@ public class PaymentServiceTest {
         }
 
         @Test
-        @DisplayName("성공: 결제가 READY 상태이고 금액이 일치하면 준비 DTO를 정상 반환한다")
+        @DisplayName("성공: 결제가 READY 상태이고 금액이 일치하면 선점(PROCESSING)에 성공하고 준비 DTO를 반환한다")
         void success() {
             given(paymentRepository.findByTossOrderIdWithOrder(tossOrderId)).willReturn(Optional.of(payment));
+            given(paymentRepository.markProcessingIfReady(
+                    payment.getId(), paymentKey, PaymentStatus.READY, PaymentStatus.PROCESSING))
+                    .willReturn(1);
 
             PaymentConfirmPrepareDto result = paymentService.validateAndPrepareConfirm(requestDto);
 
             assertThat(result).isNotNull();
             assertThat(result.commands().size()).isEqualTo(2);
+        }
+
+        @Test
+        @DisplayName("실패: 동시에 들어온 다른 요청이 이미 선점(PROCESSING)에 성공했다면 PAYMENT_ALREADY_PROCESSING 예외가 발생한다")
+        void fail_AlreadyProcessing_ConcurrentClaim() {
+            given(paymentRepository.findByTossOrderIdWithOrder(tossOrderId)).willReturn(Optional.of(payment));
+            // 조건부 업데이트의 영향받은 행이 0건 -> 다른 요청이 먼저 READY->PROCESSING 전이에 성공한 상황
+            given(paymentRepository.markProcessingIfReady(
+                    payment.getId(), paymentKey, PaymentStatus.READY, PaymentStatus.PROCESSING))
+                    .willReturn(0);
+
+            assertThatThrownBy(() -> paymentService.validateAndPrepareConfirm(requestDto))
+                    .isInstanceOf(AppException.class)
+                    .extracting("errorCode")
+                    .isEqualTo(PaymentErrorCode.PAYMENT_ALREADY_PROCESSING);
         }
 
         @Test
@@ -241,10 +340,12 @@ public class PaymentServiceTest {
         @DisplayName("결제 승인 완료 성공 시 엔티티 상태를 변경하고 승인 및 상태 변경 이벤트를 발행한다")
         void completePaymentSuccess() {
             // given
+            // validateAndPrepareConfirm()의 선점(claim)을 거쳐 온 결제이므로 직전 상태는 PROCESSING이다.
+            ReflectionTestUtils.setField(payment, "payStatus", PaymentStatus.PROCESSING);
             given(paymentRepository.findByTossOrderIdWithOrder(tossOrderId)).willReturn(Optional.of(payment));
 
             // when
-            paymentService.completePaymentSuccess(tossOrderId, paymentKey, PaymentStatus.READY, "{}");
+            paymentService.completePaymentSuccess(tossOrderId, paymentKey, PaymentStatus.PROCESSING, "{}");
 
             // then
             verify(publisher).publishEvent(any(PaymentApprovedEvent.class));

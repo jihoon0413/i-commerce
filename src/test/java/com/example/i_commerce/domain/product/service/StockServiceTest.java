@@ -204,6 +204,27 @@ public class StockServiceTest {
         }
 
         @Test
+        @DisplayName("같은 주문의 재고 차감 이력이 있으면 중복 차감하지 않는다.")
+        void deductStocks_skipsDuplicateOrderDeduction() {
+            Long productItemId = 1L;
+            Long orderId = 100L;
+            Stock stock = createMockStock(productItemId);
+            List<StockDeductCommand> commands = List.of(
+                new StockDeductCommand(productItemId, 3, orderId)
+            );
+
+            given(stockRepository.findAllByProductItemIdsWithLock(anyList()))
+                .willReturn(List.of(stock));
+            given(stockHistoryRepository.existsDeductHistoryByOrderId(orderId))
+                .willReturn(true);
+
+            stockService.deductStocks(commands);
+
+            then(stock).should(never()).deduct(anyInt(), anyLong());
+            then(eventPublisher).should(never()).publishEvent(any(StockDepletedEvent.class));
+        }
+
+        @Test
         @DisplayName("재고가 조회되지 않으면 예외가 발생한다.")
         void deductStocks_fail_stockNotFound() {
             // given

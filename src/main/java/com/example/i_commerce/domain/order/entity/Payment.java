@@ -84,7 +84,7 @@ public class Payment extends BaseEntity {
     }
 
     public void completePayment(String pgTid) {
-        if (this.pgTid != null) {
+        if (this.payStatus == PaymentStatus.PAID) {
             throw new IllegalStateException("이미 결제 완료된 건입니다.");
         }
         this.pgTid = pgTid;

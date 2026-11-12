@@ -81,7 +81,9 @@ class PaymentFacadeTest {
 
         paymentFacade.confirmPayment(confirmRequestDto);
 
-        verify(paymentService).completePaymentSuccess(tossOrderId, paymentKey, PaymentStatus.READY, responseBody.toString());
+        // validateAndPrepareConfirm()에서 이미 READY -> PROCESSING 선점이 끝난 상태이므로
+        // 완료 처리 시점의 직전 상태는 PROCESSING이다.
+        verify(paymentService).completePaymentSuccess(tossOrderId, paymentKey, PaymentStatus.PROCESSING, responseBody.toString());
         verify(publisher).publishEvent(any(OrderCompletedEvent.class));
     }
 

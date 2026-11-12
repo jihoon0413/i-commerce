@@ -56,13 +56,14 @@ public class PaymentService {
             throw new AppException(PaymentErrorCode.INVALID_PAYMENT_STATUS);
         }
 
-        List<Payment> readyPayments = order.getPayments().stream()
-            .filter(payment -> Objects.equals(payment.getPayStatus(), PaymentStatus.READY))
+        List<Payment> activePayments = order.getPayments().stream()
+            .filter(payment -> payment.getPayStatus() == PaymentStatus.READY
+                || payment.getPayStatus() == PaymentStatus.PROCESSING)
             .sorted(Comparator.comparing(Payment::getId).reversed())
             .toList();
 
         Payment payment;
-        if (readyPayments.isEmpty()) {
+        if (activePayments.isEmpty()) {
 
             payment = paymentRepository.save(Payment.builder()
                 .order(order)
@@ -73,11 +74,18 @@ public class PaymentService {
 
             order.getPayments().add(payment);
         } else {
-            payment = readyPayments.getFirst();
+            payment = activePayments.getFirst();
 
-            if (readyPayments.size() > 1) {
-                for (int i = 1; i < readyPayments.size(); i++) {
-                    readyPayments.get(i).changePayStatus(PaymentStatus.FAILED);
+            // 가장 최근 결제 시도가 이미 선점(PROCESSING)되어 승인 처리 중이라면
+            // 새 결제를 발급하지 않고 진행 중임을 알린다.
+            if (payment.getPayStatus() == PaymentStatus.PROCESSING) {
+                throw new AppException(PaymentErrorCode.PAYMENT_ALREADY_PROCESSING);
+            }
+
+            for (int i = 1; i < activePayments.size(); i++) {
+                Payment stale = activePayments.get(i);
+                if (stale.getPayStatus() == PaymentStatus.READY) {
+                    stale.changePayStatus(PaymentStatus.FAILED);
                 }
             }
         }
@@ -91,7 +99,7 @@ public class PaymentService {
     // 결제 - 에러 핸들링
     //-----------------------------------
 
-    @Transactional(readOnly = true)
+    @Transactional
     public PaymentConfirmPrepareDto validateAndPrepareConfirm(PaymentConfirmRequest dto) {
         Payment payment = paymentRepository.findByTossOrderIdWithOrder(dto.tossOrderId())
             .orElseThrow(() -> new AppException(PaymentErrorCode.PAYMENT_NOT_FOUND));
@@ -107,6 +115,14 @@ public class PaymentService {
         List<StockDeductCommand> commands = order.getOrderProducts().stream()
             .map(op -> new StockDeductCommand(op.getProductSkuId(), op.getCount(), order.getId()))
             .toList();
+
+        // READY -> PROCESSING 조건부 업데이트. 영향받은 행이 0이면 동시에 들어온 다른 요청이
+        // 이미 선점에 성공했다는 뜻이므로, 이 요청은 PG 호출/재고 차감을 진행하지 않고 즉시 중단한다.
+        int updated = paymentRepository.markProcessingIfReady(
+            payment.getId(), dto.paymentKey(), PaymentStatus.READY, PaymentStatus.PROCESSING);
+        if (updated == 0) {
+            throw new AppException(PaymentErrorCode.PAYMENT_ALREADY_PROCESSING);
+        }
 
         return PaymentConfirmPrepareDto.of(payment, order.getId(), commands);
     }
