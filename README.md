@@ -18,8 +18,8 @@
 - 동일 주문 건에 대한 네트워크 중복 요청 시 이중 승인 위험 노출.
 
 ### [해결 전략 및 아키텍처]
-1. **상태 선점 기반 중복 결제 방어**:
-   - 요청 진입 즉시 주문 상태를 `PROCESSING`으로 선점하여 동시성 인입 요청을 `PAYMENT_ALREADY_PROCESSING`으로 즉시 거절.
+1. **원자적 조건부 UPDATE 기반 중복 결제 방어**
+   - 요청 진입 즉시 **원자적 조건부 UPDATE(`WHERE pay_status = 'READY'`)** 로 주문 상태를 `PROCESSING`으로 선점하고, DB 행 단위 직렬화(Row-level Lock)를 통해 후발 중복 요청(갱신 행 수 0건)을 `PAYMENT_ALREADY_PROCESSING` 예외로 즉시 거절.
    <br>
    <img width="266" height="324" alt="image" src="https://github.com/user-attachments/assets/d0e0f851-f70b-408c-b1f4-38ac0b9c5356" />
 
@@ -38,9 +38,6 @@
    <img width="576" height="354" alt="image" src="https://github.com/user-attachments/assets/5361f282-f06e-4a3c-96a6-0fcc97917a7e" />
    
 4. **`UNKNOWN_HOLD` 격리 및 망 취소 사후 복구 스케줄러**:
-   - 응답 타임아웃 시 섣불리 실패 확정하지 않고 `UNKNOWN_HOLD` 상태로 격리.
-   - 5분 주기 스케줄러가 PG 상태를 재조회(Reconcile)하여 `PAID` 또는 `CANCELED`로 최종 일관성(Eventual Consistency) 확보.
-     
    - **타임아웃 격리**: 승인/취소 API 호출 중 네트워크 타임아웃 발생 시 섣불리 실패 처리하지 않고, 상태를 각각 `UNKNOWN_HOLD` / `CANCEL_UNKNOWN_HOLD`로 격리.
    - **망 취소 및 최종 일관성 확보**: 5분 주기 복구 스케줄러가 PG 상태를 재조회(Reconcile)하여 승인 여부를 확인한 뒤, 불일치 시 **망 취소를 수행**하거나 정상 처리하여 `PAID` 또는 `CANCELED`로 최종 일관성 확보.
    <br>
@@ -64,13 +61,27 @@
 
 
 ## 2. 외부 PG 지연 격리를 위한 트랜잭션 경계 분리 (Facade 패턴)
-- **문제 현상**: 결제 비즈니스 로직과 외부 PG API 호출이 단일 `@Transactional` 내에 묶여 있어, PG 네트워크 지연(I/O Block) 동안 DB 커넥션을 반환하지 못하는 병목 발생.
-- **원인 분석**: 외부 API 응답 대기 시간이 곧 HikariCP 커넥션 점유 시간으로 이어져, 동시 요청 증가 시 커넥션 풀(Pool Size: 45) 고갈 위험 노출.
-- **해결 전략**:
-  - `PaymentFacade` 계층을 도입하여 트랜잭션 경계 분리.
-  - `주문 생성(DB 트랜잭션)` $\rightarrow$ `PG 결제 승인(트랜잭션 외부)` $\rightarrow$ `결제 완료 처리(DB 트랜잭션)` 구조로 재설계하여 순수 DB I/O 구간에서만 커넥션을 점유하도록 격리.
-- **정량적 성과**:
-  - WireMock 기반 지연 모사 환경에서 **목표 TPS 50 달성 시 HikariCP 커넥션 고갈 0건**, 정상 요청 에러율 0% 유지.
+### [문제 현상 및 배경]
+- 결제 처리 전체를 단일 `@Transactional`로 묶어 실행할 경우, 외부 PG사 승인 응답을 기다리는 네트워크 I/O 시간 동안 DB 커넥션을 점유.
+- PG사 응답 지연 또는 장애 발생 시 **HikariCP 커넥션 풀이 고갈되어 결제와 무관한 전체 API까지 마비되는 장애 전파 위험** 존재.
+
+### [해결 전략 및 아키텍처]
+1. **Facade 패턴 기반 DB I/O와 외부 네트워크 호출 경계 분리**
+   - `PaymentFacade` 계층을 도입하여 트랜잭션이 필요한 순수 DB 작업과 지연 시간이 긴 외부 PG 호출을 명확히 분리.
+   <br>
+   <img width="1832" height="844" alt="image" src="https://github.com/user-attachments/assets/ff4bf561-a3ba-46c0-9479-b92982fd7a26" />
+
+
+2. **트랜잭션 생명주기 최소화 (DB 커넥션 즉시 반환)**
+   - **DB 작업 분리**: 결제 준비(`PROCESSING` 선점) 및 결제 확정(`PAID`/재고 차감) 등 순수 DB I/O만 독립된 개별 `@Transactional` 메서드로 실행 후 즉시 커넥션을 커넥션 풀에 반환.
+   - **외부 호출 격리**: 외부 PG 승인 API 호출은 트랜잭션 밖(Facade 레벨)에서 수행하여, 커넥션 점유 시간을 네트워크 지연과 무관한 순수 DB 처리 시간(수 ms)으로 한정.
+
+### [부하 테스트 결과] - [테스트 회고](https://velog.io/@wlgns0413/%EB%B6%80%ED%95%98%ED%85%8C%EC%8A%A4%ED%8A%B8-%ED%9A%8C%EA%B3%A0)
+| 테스트 시나리오 (WireMock) | 부하 조건 (VU) | 검증 결과 및 아키텍처 성과 |
+| :--- | :---: | :--- |
+| **정상 ~ 경미한 PG 지연 (0.3s)** | 40 / 100 | 커넥션 풀 고갈 없이 안정적인 TPS 및 응답 시간 유지 |
+| **심각한 PG 지연 (0.5s ~ 2.5s)** | 40 / 100 | 외부 PG 지연이 DB 커넥션 풀 점유로 전파되지 않음을 검증 |
+| **PG 지연 (0.5s ~ 2.5s) + 에러율 80%** | 50 / 130 | 극한 장애 상황에서도 DB 커넥션 풀 고갈 방어 확인 및 **결제 유형별 재시도·장애 격리(Circuit Breaker 등) 분리 설계의 정량적 근거 확보** |
 
 ---
 
