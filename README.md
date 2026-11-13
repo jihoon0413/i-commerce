@@ -111,17 +111,5 @@
 
 ---
 
-# 📊 부하 테스트 및 한계 지표 분석 (Troubleshooting & Next Step)
-
-- **테스트 환경**: AWS EC2, WireMock(PG 장애/지연 모사), HikariCP Max 45
-- **측정 결과 및 병목 확인**:
-  - 목표 TPS 50 환경에서 안정적인 트랜잭션 처리를 확인.
-  - 그러나 `@Retryable`을 통한 단순 재시도 적용 시, 외부 PG 장애 상황에서 재시도 대기 시간이 누적되어 **p95 응답 지연이 최대 8초까지 상승하는 한계**를 확인.
-- **인사이트 & Next Step**:
-  - 성공률은 방어했으나 사용자 응답 지연이 심각해지는 문제를 인식하고, 후속 프로젝트에서 **결제 유형별 신뢰성 전략(Fast-Fail / Circuit Breaker) 및 Transactional Outbox 기반 비동기 접수 구조**로 개선하는 계기가 됨.
-
-
-
-
-| **데이터 아키텍처** | [Draw.io / ERDCloud 스키마 구조도](https://www.erdcloud.com/d/itmzsXzjE3eRcfGoy)                                                                                                                                             |
-| **API 명세서** | [Swagger API 정적 문서 주소](http://localhost:8080/swagger-ui/index.html?urls.primaryName=Member)  
+**데이터 아키텍처** : [Draw.io / ERDCloud 스키마 구조도](https://www.erdcloud.com/d/itmzsXzjE3eRcfGoy)
+**API 명세서** : [Swagger API 정적 문서 주소](http://localhost:8080/swagger-ui/index.html?urls.primaryName=Member)
